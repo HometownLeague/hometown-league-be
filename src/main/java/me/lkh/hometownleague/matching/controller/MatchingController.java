@@ -4,14 +4,12 @@ import jakarta.servlet.http.HttpServletRequest;
 import me.lkh.hometownleague.common.exception.ErrorCode;
 import me.lkh.hometownleague.common.response.CommonResponse;
 import me.lkh.hometownleague.common.util.SessionUtil;
+import me.lkh.hometownleague.matching.service.MatchingRedisService;
 import me.lkh.hometownleague.matching.service.MatchingService;
 import me.lkh.hometownleague.session.domain.AuthCheck;
 import me.lkh.hometownleague.session.domain.UserSession;
 import me.lkh.hometownleague.session.service.SessionService;
-import org.springframework.web.bind.annotation.PostMapping;
-import org.springframework.web.bind.annotation.RequestBody;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.bind.annotation.*;
 
 import java.util.Map;
 
@@ -28,8 +26,8 @@ public class MatchingController {
         this.sessionService = sessionService;
     }
 
-    /** 신규 매칭 요청
-     *
+    /**
+     * 신규 매칭 요청
      * @param httpServletRequest
      * @return
      */
@@ -41,5 +39,15 @@ public class MatchingController {
         matchingService.makeMatchingRequest(userSession.getUserId(), teamId);
 
         return CommonResponse.withEmptyData(ErrorCode.SUCCESS);
+    }
+
+    /**
+     * 사용자가 속한 팀의 매칭 요청 목록 조회
+     * @param userId
+     * @return
+     */
+    @GetMapping("/{userId}")
+    public CommonResponse selectMatching(@PathVariable("userId") String userId){
+        return new CommonResponse(matchingService.selectMatching(userId));
     }
 }
