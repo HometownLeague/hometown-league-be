@@ -5,14 +5,15 @@ import me.lkh.hometownleague.common.exception.common.CommonErrorException;
 import me.lkh.hometownleague.common.exception.matching.*;
 import me.lkh.hometownleague.common.exception.team.NoSuchTeamIdException;
 import me.lkh.hometownleague.common.exception.team.NotOwnerException;
-import me.lkh.hometownleague.matching.domain.MatchingInfo;
-import me.lkh.hometownleague.matching.domain.MatchingListElement;
-import me.lkh.hometownleague.matching.domain.MatchingQueueElement;
+import me.lkh.hometownleague.matching.domain.*;
 import me.lkh.hometownleague.matching.domain.response.MatchingDetailBase;
 import me.lkh.hometownleague.matching.domain.response.MatchingDetailResponse;
 import me.lkh.hometownleague.matching.domain.response.MatchingDetailTeam;
 import me.lkh.hometownleague.matching.repository.MatchingRepository;
+import me.lkh.hometownleague.rank.domain.CalculatedScore;
+import me.lkh.hometownleague.rank.service.RankService;
 import me.lkh.hometownleague.team.domain.Team;
+import me.lkh.hometownleague.team.repository.TeamRepository;
 import me.lkh.hometownleague.team.service.TeamService;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -26,16 +27,22 @@ import java.util.stream.Collectors;
 @Service
 public class MatchingService {
 
+    private final TeamRepository teamRepository;
+
     private final MatchingRepository matchingRepository;
 
     private final TeamService teamService;
 
     private final MatchingRedisService matchingRedisService;
 
-    public MatchingService(MatchingRepository matchingRepository, TeamService teamService, MatchingRedisService matchingRedisService) {
+    private final RankService rankService;
+
+    public MatchingService(TeamRepository teamRepository, MatchingRepository matchingRepository, TeamService teamService, MatchingRedisService matchingRedisService, RankService rankService) {
+        this.teamRepository = teamRepository;
         this.matchingRepository = matchingRepository;
         this.teamService = teamService;
         this.matchingRedisService = matchingRedisService;
+        this.rankService = rankService;
     }
 
     @Transactional
@@ -235,4 +242,77 @@ public class MatchingService {
                         });
     }
 
+    @Transactional
+    public void reportResult(MatchingResultReportRequest matchingResult, String userId) {
+
+        Optional.ofNullable(matchingRepository.matchingRequestDeleteCheck(matchingResult.getMatchingRequestId()))
+                .ifPresentOrElse(matchingRequestDeleteCheck -> {
+                    // 소유주가 아니면 결과등록할 수 없음.
+                    Team selectedTeam = teamService.isOwner(userId, matchingRequestDeleteCheck.getTeamId());
+
+                    // 상대팀의 매칭요청ID 조회
+                    Optional.ofNullable(matchingRepository.selectOtherTeamRequestIdForResult(matchingResult.getMatchingRequestId()))
+                            .ifPresentOrElse(otherTeamMatchingRequestId -> {
+                                // 매칭 결과 조회
+                                Optional.ofNullable(matchingRepository.selectMatchingResultInfo(matchingResult.getMatchingRequestId()))
+                                        .ifPresentOrElse(matchingResultInfo -> {
+                                            //이미 결과가 등록된 경우
+                                            throw new MatchingResultAlreadyExistException();
+                                        },
+                                        () -> {
+
+                                            // 매칭 결과 삽입
+                                            if(1 != matchingRepository.insertMatchingResultInfo(matchingResult)) {
+                                                throw new CommonErrorException("failed to insert matching result info");
+                                            }
+
+                                            // 상대팀이 이미 결과를 입력한 상태라면, 매칭상태 변경
+                                            Optional.ofNullable(matchingRepository.selectMatchingResultInfo(otherTeamMatchingRequestId))
+                                                    .ifPresent(otherTeamMatchingResultInfo -> {
+
+                                                        String status = null;
+                                                        if(matchingResult.getOurTeamScore() == otherTeamMatchingResultInfo.getOtherTeamScore()
+                                                            && matchingResult.getOtherTeamScore() == otherTeamMatchingResultInfo.getOurTeamScore()) {
+                                                            status = "E";   // 상대방이 입력한 점수와 우리팀이 입력한 점수가 같다면 : 경기종료 상태
+                                                        } else {
+                                                            status = "F";   // 결과입력 실패 상태
+                                                        }
+
+                                                        // 매칭 요청에 점수등록 및 매칭 상태 변경
+                                                        if(1 != matchingRepository.updateMatchingRequestMapping(new MatchingRequestMappingScoreUpdate(status, matchingResult.getMatchingRequestId(), otherTeamMatchingResultInfo.getMatchingRequestId(), matchingResult.getOurTeamScore(), otherTeamMatchingResultInfo.getOurTeamScore()))){
+                                                            throw new CommonErrorException("failed to update matching request mapping");
+                                                        }
+
+                                                        // 점수가 정상처리된 경우에만 랭크 계산
+                                                        if("E".equals(status)) {
+                                                            // 각팀 정보 조회해서 점수 계산
+                                                            calculateAndUpdateScore(matchingResult.getMatchingRequestId(), otherTeamMatchingResultInfo.getMatchingRequestId(), matchingResult.getOurTeamScore(), otherTeamMatchingResultInfo.getOurTeamScore());
+                                                        }
+                                                    });
+
+                                        });
+                            },
+                            () -> { throw new CannotFindOtherTeamRequestIdException(); });
+                },
+                () -> { throw new NoSuchMatchingRequestIdException(); });
+    }
+
+    private void calculateAndUpdateScore(int aTeamRequestId, int bTeamRequestId, int aTeamScore, int bTeamScore){
+        Team aTeam = teamRepository.selectTeamByMatchingRequestId(aTeamRequestId);
+        Team bTeam = teamRepository.selectTeamByMatchingRequestId(bTeamRequestId);
+
+        if(aTeam == null || bTeam == null){
+            throw new CommonErrorException("failed to get team info by matching request id.");
+        }
+
+        CalculatedScore calculatedScore = rankService.calculateScore(aTeam, bTeam, aTeamScore, bTeamScore);
+
+        if(1 != teamRepository.updateTeamScore(aTeam.getId(), calculatedScore.getaTeamScore())){
+            throw new CommonErrorException("failed to update team rank socre: " + aTeam.getId());
+        }
+
+        if(1 != teamRepository.updateTeamScore(bTeam.getId(), calculatedScore.getbTeamScore())){
+            throw new CommonErrorException("failed to update team rank socre: " + aTeam.getId());
+        }
+    }
 }
